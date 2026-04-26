@@ -20,6 +20,8 @@ import ctypes
 from ctypes import wintypes
 import struct
 import time
+import json
+import os
 
 try:
     import pystray
@@ -55,9 +57,22 @@ PRESETS = {
     "Full (100%)":  100,
 }
 
-HOTKEY_UP   = "ctrl+alt+="   # Ctrl+Alt+Plus  → brightness +10
-HOTKEY_DOWN = "ctrl+alt+-"   # Ctrl+Alt+Minus → brightness -10
+# Register multiple aliases because keyboard layouts and numpad naming differ.
+HOTKEY_UP_BINDINGS = [
+    "ctrl+alt+=",
+    "ctrl+alt++",
+    "ctrl+alt+plus",
+    "ctrl+alt+add",
+]
+HOTKEY_DOWN_BINDINGS = [
+    "ctrl+alt+-",
+    "ctrl+alt+minus",
+    "ctrl+alt+subtract",
+]
 STEP = 10
+
+SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", ""), "NvidiaBrightnessTray")
+SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 
 # ─── GAMMA / BRIGHTNESS VIA GDI ──────────────────────────────────────────────
 # Windows GDI SetDeviceGammaRamp works at the driver level — same effect as
@@ -122,6 +137,27 @@ def get_current_brightness() -> int:
     mid = gamma[128]  # index 128 in red channel
     approx = int((mid / 65535) * 100 / (128/255))
     return max(10, min(100, approx))
+
+
+def _load_saved_brightness(default: int = 91) -> int:
+    """Load last saved brightness from disk."""
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        value = int(data.get("brightness", default))
+        return max(10, min(100, value))
+    except Exception:
+        return default
+
+
+def _save_brightness(value: int) -> None:
+    """Persist brightness to disk for next app launch."""
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"brightness": int(max(10, min(100, value)))}, f)
+    except Exception:
+        pass
 
 
 # ─── POWER RESUME HANDLING (RE-APPLY GAMMA RAMP) ──────────────────────────────
@@ -252,7 +288,7 @@ def _start_power_event_listener(on_resume_callback):
 
 class BrightnessApp:
     def __init__(self):
-        self.brightness = 91  # start at your usual setting
+        self.brightness = _load_saved_brightness(default=91)
         set_brightness(self.brightness)
         self.icon = self._create_icon()
         self._resume_reapply_lock = threading.Lock()
@@ -321,8 +357,8 @@ class BrightnessApp:
             pystray.Menu.SEPARATOR,
             item(lambda _: f"Current: {self.brightness}%", lambda i, it: None, enabled=False),
             pystray.Menu.SEPARATOR,
-            item("Brighter  (Ctrl+Alt+=)", lambda i, it: self._step(+STEP)),
-            item("Dimmer    (Ctrl+Alt+-)", lambda i, it: self._step(-STEP)),
+            item("Brighter  (Ctrl+Alt +/+)", lambda i, it: self._step(+STEP)),
+            item("Dimmer    (Ctrl+Alt -/-)", lambda i, it: self._step(-STEP)),
             pystray.Menu.SEPARATOR,
             item("Quit", on_quit),
         )
@@ -337,6 +373,7 @@ class BrightnessApp:
     def _apply(self, level: int):
         self.brightness = max(10, min(100, level))
         ok = set_brightness(self.brightness)
+        _save_brightness(self.brightness)
         status = "✓" if ok else "✗ GDI failed"
         self.icon.icon = self._make_icon_image(self.brightness)
         self.icon.title = f"NVIDIA Brightness: {self.brightness}% {status}"
@@ -348,9 +385,23 @@ class BrightnessApp:
     def _setup_hotkeys(self):
         if not HAS_KEYBOARD:
             return
-        keyboard.add_hotkey(HOTKEY_UP,   lambda: self._step(+STEP), suppress=True)
-        keyboard.add_hotkey(HOTKEY_DOWN, lambda: self._step(-STEP), suppress=True)
-        print(f"Hotkeys: {HOTKEY_UP} / {HOTKEY_DOWN}")
+        registered = []
+        for hk in HOTKEY_UP_BINDINGS:
+            try:
+                keyboard.add_hotkey(hk, lambda: self._step(+STEP), suppress=True)
+                registered.append(hk)
+            except Exception:
+                pass
+        for hk in HOTKEY_DOWN_BINDINGS:
+            try:
+                keyboard.add_hotkey(hk, lambda: self._step(-STEP), suppress=True)
+                registered.append(hk)
+            except Exception:
+                pass
+        if registered:
+            print(f"Hotkeys registered: {', '.join(registered)}")
+        else:
+            print("No hotkeys were registered.")
 
     def run(self):
         # Hotkeys in background thread
@@ -361,7 +412,7 @@ class BrightnessApp:
         _start_power_event_listener(self._reapply_after_resume)
 
         print(f"Tray running. Brightness: {self.brightness}%")
-        print(f"Hotkeys: Ctrl+Alt+= (up), Ctrl+Alt+- (down)")
+        print("Hotkeys: Ctrl+Alt plus (up), Ctrl+Alt minus (down)")
         self.icon.run()
 
 
