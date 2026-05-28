@@ -91,4 +91,4 @@ GUI, GDI gamma calls, tray icon, hotkeys, and OS power/display events require a 
 
 ## License
 
-Personal project — no license specified.
+[MIT](LICENSE) © igorl-commits
