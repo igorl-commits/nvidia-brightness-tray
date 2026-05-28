@@ -88,33 +88,37 @@ def _get_primary_dc():
 def _release_dc(hdc):
     user32.ReleaseDC(None, hdc)
 
-def _brightness_to_ramp(brightness_pct: int) -> bytes:
+def _compute_ramp(brightness_pct: int, warmth_pct: int = 0) -> bytes:
     """
-    Convert 0-100 brightness % to a 256-entry gamma ramp.
-    Each entry is a 16-bit value. At 100% → linear (identity).
-    At lower values → compressed toward black.
-    Matches roughly what NVIDIA CP does with its brightness slider.
+    Build a 3×256 uint16 gamma ramp from brightness (10-100) and warmth (0-100).
+    Red is untouched; green and blue are scaled down as warmth rises (blue most),
+    producing an amber, lower-blue-light tint. At warmth=0 all channels are equal
+    (matches the original single-channel ramp). At brightness=100, warmth=0 the
+    ramp is identity. Matches roughly what NVIDIA CP does with its brightness slider.
     """
-    scale = brightness_pct / 100.0
-    ramp = []
-    for i in range(256):
-        val = int(i * scale * 257)   # 257 = 65535/255
-        val = max(0, min(65535, val))
-        ramp.append(val)
+    brightness_pct = max(10, min(100, int(brightness_pct)))
+    warmth_pct = max(0, min(100, int(warmth_pct)))
+    b_scale = brightness_pct / 100.0
+    green_scale = 1.0 - 0.20 * (warmth_pct / 100.0)
+    blue_scale = 1.0 - 0.55 * (warmth_pct / 100.0)
+    channel_scales = (1.0, green_scale, blue_scale)  # R, G, B order
     # Ramp is 3 channels × 256 × 2 bytes (little-endian uint16)
     data = b""
-    for channel in range(3):
-        for v in ramp:
-            data += struct.pack("<H", v)
+    for cs in channel_scales:
+        for i in range(256):
+            val = int(i * b_scale * cs * 257)   # 257 = 65535/255
+            val = max(0, min(65535, val))
+            data += struct.pack("<H", val)
     return data
 
-def set_brightness(brightness_pct: int) -> bool:
-    """Apply brightness via GDI gamma ramp. Returns True on success."""
+def set_brightness(brightness_pct: int, warmth_pct: int = 0) -> bool:
+    """Apply brightness + warmth via GDI gamma ramp. Returns True on success."""
     brightness_pct = max(10, min(100, brightness_pct))
+    warmth_pct = max(0, min(100, warmth_pct))
     hdc = _get_primary_dc()
     if not hdc:
         return False
-    ramp = _brightness_to_ramp(brightness_pct)
+    ramp = _compute_ramp(brightness_pct, warmth_pct)
     # SetDeviceGammaRamp expects a 3×256 array of WORD
     GammaArray = ctypes.c_uint16 * (3 * 256)
     gamma = GammaArray(*struct.unpack("<768H", ramp))
@@ -139,23 +143,30 @@ def get_current_brightness() -> int:
     return max(10, min(100, approx))
 
 
-def _load_saved_brightness(default: int = 91) -> int:
-    """Load last saved brightness from disk."""
+def _load_settings(default_brightness: int = 91, default_warmth: int = 0):
+    """Load (brightness, warmth) from disk. Missing warmth key -> 0 (old format)."""
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        value = int(data.get("brightness", default))
-        return max(10, min(100, value))
+        b = int(data.get("brightness", default_brightness))
+        w = int(data.get("warmth", default_warmth))
+        return max(10, min(100, b)), max(0, min(100, w))
     except Exception:
-        return default
+        return default_brightness, default_warmth
 
 
-def _save_brightness(value: int) -> None:
-    """Persist brightness to disk for next app launch."""
+def _save_settings(brightness: int, warmth: int) -> None:
+    """Persist brightness + warmth for next app launch."""
     try:
         os.makedirs(SETTINGS_DIR, exist_ok=True)
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump({"brightness": int(max(10, min(100, value)))}, f)
+            json.dump(
+                {
+                    "brightness": int(max(10, min(100, brightness))),
+                    "warmth": int(max(0, min(100, warmth))),
+                },
+                f,
+            )
     except Exception:
         pass
 
