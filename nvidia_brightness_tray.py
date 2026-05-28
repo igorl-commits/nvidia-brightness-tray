@@ -491,6 +491,7 @@ class BrightnessApp:
         status = "✓" if ok else "✗ GDI failed"
         self.icon.icon = self._make_icon_image(self.brightness)
         self.icon.title = f"NVIDIA Brightness: {self.brightness}% · warm {self.warmth}% {status}"
+        self.icon.update_menu()  # re-render dynamic "Current" label + radio checkmarks
         print(f"Brightness → {self.brightness}%  Warmth → {self.warmth}% ({status})")
 
     def _step(self, delta: int):
