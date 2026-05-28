@@ -356,6 +356,21 @@ def _start_power_event_listener(on_resume_callback):
     return t
 
 
+def _is_windows_dark_theme() -> bool:
+    """Detect if Windows is using dark theme for apps (0 = dark)."""
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        )
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return value == 0
+    except Exception:
+        return True  # default dark
+
+
 # ─── SLIDER WINDOW (TKINTER) ──────────────────────────────────────────────────
 
 class SliderWindow:
@@ -383,48 +398,71 @@ class SliderWindow:
 
         self._tk = tk
         self.root = tk.Tk()
-        self.root.title("Brightness & Warmth")
-        self.root.resizable(False, False)
-        self.root.attributes("-topmost", True)
-        self.root.configure(bg="#1e1e1e")  # dark modern utility background
 
-        # Try to get a slightly better looking theme
+        # Glass / borderless modern look (no borders, draggable)
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+
+        # Detect and apply system theme
+        self._is_dark = _is_windows_dark_theme()
+
+        bg = "#1f1f1f" if self._is_dark else "#f3f3f3"
+        fg = "#e0e0e0" if self._is_dark else "#1f1f1f"
+        accent_b = "#4a9eff" if self._is_dark else "#0078d4"
+        accent_w = "#ff9f4a" if self._is_dark else "#e07a2f"
+
+        self.root.configure(bg=bg)
+
+        # Draggable (no title bar)
+        self._drag_data = {"x": 0, "y": 0}
+        self.root.bind("<ButtonPress-1>", self._start_drag)
+        self.root.bind("<B1-Motion>", self._do_drag)
+
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except Exception:
             pass
 
+        # Very thin modern sliders
+        style.configure("ThinB.Horizontal.TScale", background=bg, troughcolor="#3a3a3a" if self._is_dark else "#d0d0d0",
+                        sliderlength=10, sliderthickness=5)
+        style.configure("ThinW.Horizontal.TScale", background=bg, troughcolor="#3a3a3a" if self._is_dark else "#d0d0d0",
+                        sliderlength=10, sliderthickness=5)
+
         b0, w0 = self.get_state()
         self.b_var = tk.IntVar(value=b0)
         self.w_var = tk.IntVar(value=w0)
 
-        # Labels + live value displays (Option A style)
-        self.b_label = tk.Label(self.root, text="Brightness", bg="#1e1e1e", fg="#ddd", font=("Segoe UI", 10))
-        self.w_label = tk.Label(self.root, text="Warmth",     bg="#1e1e1e", fg="#ddd", font=("Segoe UI", 10))
+        # Only B and W labels (big, clear)
+        self.b_label = tk.Label(self.root, text="B", bg=bg, fg=accent_b, font=("Segoe UI", 18, "bold"))
+        self.w_label = tk.Label(self.root, text="W", bg=bg, fg=accent_w, font=("Segoe UI", 18, "bold"))
 
-        self.b_value = tk.Label(self.root, text=f"{b0}%", bg="#1e1e1e", fg="#ddd", width=6, anchor="e")
-        self.w_value = tk.Label(self.root, text=f"{w0}%", bg="#1e1e1e", fg="#ddd", width=6, anchor="e")
+        self.b_value = tk.Label(self.root, text=f"{b0}%", bg=bg, fg=fg, font=("Segoe UI", 11))
+        self.w_value = tk.Label(self.root, text=f"{w0}%", bg=bg, fg=fg, font=("Segoe UI", 11))
 
-        # Sliders
         self.b_scale = ttk.Scale(self.root, from_=10, to=100, orient=tk.HORIZONTAL,
-                                 variable=self.b_var, command=self._on_slider)
+                                 variable=self.b_var, command=self._on_slider,
+                                 style="ThinB.Horizontal.TScale")
         self.w_scale = ttk.Scale(self.root, from_=0, to=100, orient=tk.HORIZONTAL,
-                                 variable=self.w_var, command=self._on_slider)
+                                 variable=self.w_var, command=self._on_slider,
+                                 style="ThinW.Horizontal.TScale")
 
-        # Layout using grid for clean alignment
-        self.b_label.grid(row=0, column=0, padx=(14, 8), pady=(14, 2), sticky="w")
-        self.b_scale.grid(row=0, column=1, padx=4, pady=(14, 2), sticky="ew")
-        self.b_value.grid(row=0, column=2, padx=(6, 14), pady=(14, 2))
+        # Tight glass-like layout
+        self.b_label.grid(row=0, column=0, padx=(10, 3), pady=(8, 1), sticky="w")
+        self.b_scale.grid(row=0, column=1, padx=2, pady=(8, 1), sticky="ew")
+        self.b_value.grid(row=0, column=2, padx=(3, 10), pady=(8, 1))
 
-        self.w_label.grid(row=1, column=0, padx=(14, 8), pady=(4, 2), sticky="w")
-        self.w_scale.grid(row=1, column=1, padx=4, pady=(4, 2), sticky="ew")
-        self.w_value.grid(row=1, column=2, padx=(6, 14), pady=(4, 2))
+        self.w_label.grid(row=1, column=0, padx=(10, 3), pady=(1, 6), sticky="w")
+        self.w_scale.grid(row=1, column=1, padx=2, pady=(1, 6), sticky="ew")
+        self.w_value.grid(row=1, column=2, padx=(3, 10), pady=(1, 6))
 
-        # Live color preview strip (inspired by Option A mockup)
-        self.preview = tk.Canvas(self.root, width=340, height=28, bg="#252525",
+        # Subtle preview bar
+        preview_bg = "#2a2a2a" if self._is_dark else "#e8e8e8"
+        self.preview = tk.Canvas(self.root, width=260, height=14, bg=preview_bg,
                                  highlightthickness=0, bd=0)
-        self.preview.grid(row=2, column=0, columnspan=3, padx=14, pady=(10, 14), sticky="ew")
+        self.preview.grid(row=2, column=0, columnspan=3, padx=10, pady=(0, 8), sticky="ew")
 
         self.root.grid_columnconfigure(1, weight=1)
 
@@ -433,6 +471,14 @@ class SliderWindow:
         self.root.bind("<Escape>", lambda e: self._hide())
         self.root.withdraw()
         self.root.mainloop()
+
+    def _start_drag(self, event):
+        self._drag_data = {"x": event.x, "y": event.y}
+
+    def _do_drag(self, event):
+        x = self.root.winfo_x() + event.x - self._drag_data["x"]
+        y = self.root.winfo_y() + event.y - self._drag_data["y"]
+        self.root.geometry(f"+{x}+{y}")
 
     def _on_slider(self, _value=None):
         if self._syncing:
@@ -443,33 +489,29 @@ class SliderWindow:
         self.on_change(b, w)
 
     def _update_preview_and_labels(self, b: int, w: int):
-        """Update the live % labels and the warmth color preview strip."""
         if not self.root:
             return
 
         self.b_value.config(text=f"{b}%")
         self.w_value.config(text=f"{w}%")
 
-        # Draw the live color preview gradient (Option A style)
         c = self.preview
         c.delete("all")
-        width = c.winfo_width() or 340
-        height = 28
+        width = c.winfo_width() or 260
+        height = 14
 
-        # Simple but effective gradient: cool neutral → warm amber
         for x in range(width):
-            ratio = x / max(1, width - 1)
-            # Blend from cool bluish-gray to warm amber as warmth increases
             warmth_influence = w / 100.0
-            r = int(200 * (1 - warmth_influence * 0.6) + 255 * warmth_influence * 0.95)
-            g = int(205 * (1 - warmth_influence * 0.3) + 170 * warmth_influence)
-            b_col = int(215 * (1 - warmth_influence * 0.7) + 70 * warmth_influence)
-            color = f"#{r:02x}{g:02x}{b_col:02x}"
+            if self._is_dark:
+                r = int(80 * (1 - warmth_influence * 0.3) + 255 * warmth_influence * 0.9)
+                g = int(90 * (1 - warmth_influence * 0.2) + 170 * warmth_influence)
+                b_col = int(110 * (1 - warmth_influence * 0.5) + 70 * warmth_influence)
+            else:
+                r = int(200 + 55 * warmth_influence * 0.8)
+                g = int(210 - 40 * warmth_influence * 0.5)
+                b_col = int(220 - 150 * warmth_influence * 0.7)
+            color = f"#{max(0, min(255, r)):02x}{max(0, min(255, g)):02x}{max(0, min(255, b_col)):02x}"
             c.create_line(x, 0, x, height, fill=color)
-
-        # Add a subtle position indicator for current warmth
-        marker_x = int((w / 100.0) * (width - 1))
-        c.create_rectangle(marker_x - 1, 0, marker_x + 2, height, fill="#ffffff", outline="")
 
     def _show(self):
         self._syncing = True
@@ -481,22 +523,17 @@ class SliderWindow:
         self.root.lift()
         self.root.attributes("-topmost", True)
 
-        # Make the window "modal-ish" so clicks outside can be detected
         try:
             self.root.grab_set()
         except Exception:
             pass
 
-        # Close on click away (FocusOut works well for utility panels)
         self.root.bind("<FocusOut>", self._on_focus_out, add="+")
-
-        # Force preview + labels update
-        self.root.after(40, lambda: self._update_preview_and_labels(b, w))
+        self.root.after(50, lambda: self._update_preview_and_labels(b, w))
 
     def _on_focus_out(self, event):
-        # Small delay prevents closing when clicking on the sliders themselves
         if self.root:
-            self.root.after(80, self._hide)
+            self.root.after(60, self._hide)
 
     def _hide(self):
         if self.root:
