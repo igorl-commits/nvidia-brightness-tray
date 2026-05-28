@@ -14,6 +14,16 @@ A lightweight Windows system-tray app to control display **brightness** and **co
 - **Survives sleep/resume and display changes** — re-applies the gamma ramp after the system wakes or after fullscreen games / resolution changes reset it.
 - **Start with Windows** toggle — creates/removes a Startup shortcut. Auto-enabled on first launch.
 
+## Screenshots
+
+Tray icon showing the current brightness level, with status tooltip:
+
+![Tray icon and tooltip](assets/tray-icon.png)
+
+Right-click menu — brightness steps, warmth, sliders, reset, and autostart toggle:
+
+![Tray menu](assets/menu.png)
+
 ## Requirements
 
 - Windows
