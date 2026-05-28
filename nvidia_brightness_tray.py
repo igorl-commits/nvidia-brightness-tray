@@ -47,7 +47,7 @@ try:
     HAS_WIN32 = True
 except ImportError:
     HAS_WIN32 = False
-    print("'pywin32' not installed — using GDI fallback. pip install pywin32")
+    print("'pywin32' not installed — some advanced features disabled. pip install pywin32")
 
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -164,6 +164,65 @@ def _save_settings(brightness: int, warmth: int) -> None:
             )
     except Exception:
         pass
+
+
+def _make_tray_icon_image(brightness: int, warmth: int = 0) -> "Image.Image":
+    """
+    Generate the 64×64 tray icon.
+
+    - Large brightness percentage as primary signal (legacy behavior preserved).
+    - Thin amber bar at bottom appears only when warmth > 0 (secondary, calm indicator).
+    - Number color warms slightly toward amber as warmth increases.
+    Pure function — no side effects, fully unit-testable.
+    """
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Dark rounded background with subtle border for polish
+    draw.rounded_rectangle(
+        [1, 1, 62, 62],
+        radius=11,
+        fill=(26, 26, 26, 245),
+        outline=(45, 45, 45, 200),
+        width=1,
+    )
+
+    # Brightness number (tuned size for good legibility at tray scale)
+    try:
+        font = ImageFont.truetype("arialbd.ttf", 28)
+    except Exception:
+        try:
+            font = ImageFont.truetype("arial.ttf", 28)
+        except Exception:
+            font = ImageFont.load_default()
+
+    text = str(brightness)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = (size - tw) // 2 - bbox[0]
+    ty = (size - th) // 2 - bbox[1] - 2  # minor optical centering adjustment
+
+    # Gentle color shift toward warm amber as warmth rises (secondary cue)
+    r = int(90 + (warmth * 0.85))
+    g = int(215 - (warmth * 0.65))
+    number_color = (max(60, min(255, r)), max(110, min(255, g)), 70, 255)
+    draw.text((tx, ty), text, fill=number_color, font=font)
+
+    # Warmth indicator — thin bottom bar, only visible when active
+    if warmth > 0:
+        bar_y = 52
+        bar_h = 5
+        track_color = (18, 18, 18, 255)
+        fill_color = (255, 165, 50, 255)  # warm amber
+
+        draw.rounded_rectangle([6, bar_y, 57, bar_y + bar_h], radius=2, fill=track_color)
+        fill_w = int((warmth / 100.0) * 51)
+        if fill_w > 2:
+            draw.rounded_rectangle([6, bar_y, 6 + fill_w, bar_y + bar_h], radius=2, fill=fill_color)
+
+    return img
 
 
 # ─── POWER RESUME HANDLING (RE-APPLY GAMMA RAMP) ──────────────────────────────
@@ -317,35 +376,100 @@ class SliderWindow:
     def _run(self):
         try:
             import tkinter as tk
+            from tkinter import ttk
         except Exception as e:
             print(f"Tkinter unavailable — sliders disabled: {e}")
             return
+
         self._tk = tk
         self.root = tk.Tk()
-        self.root.title("Display")
+        self.root.title("Brightness & Warmth")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
+        self.root.configure(bg="#1e1e1e")  # dark modern utility background
+
+        # Try to get a slightly better looking theme
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
 
         b0, w0 = self.get_state()
         self.b_var = tk.IntVar(value=b0)
         self.w_var = tk.IntVar(value=w0)
 
-        tk.Scale(self.root, label="Brightness", from_=10, to=100,
-                 orient=tk.HORIZONTAL, length=240, variable=self.b_var,
-                 command=self._on_slider).pack(padx=12, pady=(10, 4))
-        tk.Scale(self.root, label="Warmth", from_=0, to=100,
-                 orient=tk.HORIZONTAL, length=240, variable=self.w_var,
-                 command=self._on_slider).pack(padx=12, pady=(4, 12))
+        # Labels + live value displays (Option A style)
+        self.b_label = tk.Label(self.root, text="Brightness", bg="#1e1e1e", fg="#ddd", font=("Segoe UI", 10))
+        self.w_label = tk.Label(self.root, text="Warmth",     bg="#1e1e1e", fg="#ddd", font=("Segoe UI", 10))
+
+        self.b_value = tk.Label(self.root, text=f"{b0}%", bg="#1e1e1e", fg="#ddd", width=6, anchor="e")
+        self.w_value = tk.Label(self.root, text=f"{w0}%", bg="#1e1e1e", fg="#ddd", width=6, anchor="e")
+
+        # Sliders
+        self.b_scale = ttk.Scale(self.root, from_=10, to=100, orient=tk.HORIZONTAL,
+                                 variable=self.b_var, command=self._on_slider)
+        self.w_scale = ttk.Scale(self.root, from_=0, to=100, orient=tk.HORIZONTAL,
+                                 variable=self.w_var, command=self._on_slider)
+
+        # Layout using grid for clean alignment
+        self.b_label.grid(row=0, column=0, padx=(14, 8), pady=(14, 2), sticky="w")
+        self.b_scale.grid(row=0, column=1, padx=4, pady=(14, 2), sticky="ew")
+        self.b_value.grid(row=0, column=2, padx=(6, 14), pady=(14, 2))
+
+        self.w_label.grid(row=1, column=0, padx=(14, 8), pady=(4, 2), sticky="w")
+        self.w_scale.grid(row=1, column=1, padx=4, pady=(4, 2), sticky="ew")
+        self.w_value.grid(row=1, column=2, padx=(6, 14), pady=(4, 2))
+
+        # Live color preview strip (inspired by Option A mockup)
+        self.preview = tk.Canvas(self.root, width=340, height=28, bg="#252525",
+                                 highlightthickness=0, bd=0)
+        self.preview.grid(row=2, column=0, columnspan=3, padx=14, pady=(10, 14), sticky="ew")
+
+        self.root.grid_columnconfigure(1, weight=1)
 
         self.root.protocol("WM_DELETE_WINDOW", self._hide)
         self.root.bind("<<ShowSliders>>", lambda e: self._show())
+        self.root.bind("<Escape>", lambda e: self._hide())
         self.root.withdraw()
         self.root.mainloop()
 
     def _on_slider(self, _value=None):
         if self._syncing:
             return
-        self.on_change(self.b_var.get(), self.w_var.get())
+        b = self.b_var.get()
+        w = self.w_var.get()
+        self._update_preview_and_labels(b, w)
+        self.on_change(b, w)
+
+    def _update_preview_and_labels(self, b: int, w: int):
+        """Update the live % labels and the warmth color preview strip."""
+        if not self.root:
+            return
+
+        self.b_value.config(text=f"{b}%")
+        self.w_value.config(text=f"{w}%")
+
+        # Draw the live color preview gradient (Option A style)
+        c = self.preview
+        c.delete("all")
+        width = c.winfo_width() or 340
+        height = 28
+
+        # Simple but effective gradient: cool neutral → warm amber
+        for x in range(width):
+            ratio = x / max(1, width - 1)
+            # Blend from cool bluish-gray to warm amber as warmth increases
+            warmth_influence = w / 100.0
+            r = int(200 * (1 - warmth_influence * 0.6) + 255 * warmth_influence * 0.95)
+            g = int(205 * (1 - warmth_influence * 0.3) + 170 * warmth_influence)
+            b_col = int(215 * (1 - warmth_influence * 0.7) + 70 * warmth_influence)
+            color = f"#{r:02x}{g:02x}{b_col:02x}"
+            c.create_line(x, 0, x, height, fill=color)
+
+        # Add a subtle position indicator for current warmth
+        marker_x = int((w / 100.0) * (width - 1))
+        c.create_rectangle(marker_x - 1, 0, marker_x + 2, height, fill="#ffffff", outline="")
 
     def _show(self):
         self._syncing = True
@@ -357,8 +481,29 @@ class SliderWindow:
         self.root.lift()
         self.root.attributes("-topmost", True)
 
+        # Make the window "modal-ish" so clicks outside can be detected
+        try:
+            self.root.grab_set()
+        except Exception:
+            pass
+
+        # Close on click away (FocusOut works well for utility panels)
+        self.root.bind("<FocusOut>", self._on_focus_out, add="+")
+
+        # Force preview + labels update
+        self.root.after(40, lambda: self._update_preview_and_labels(b, w))
+
+    def _on_focus_out(self, event):
+        # Small delay prevents closing when clicking on the sliders themselves
+        if self.root:
+            self.root.after(80, self._hide)
+
     def _hide(self):
         if self.root:
+            try:
+                self.root.grab_release()
+            except Exception:
+                pass
             self.root.withdraw()
 
     def request_show(self):
@@ -400,35 +545,12 @@ class BrightnessApp:
         finally:
             self._resume_reapply_lock.release()
 
-    def _make_icon_image(self, level: int) -> Image.Image:
-        """Draw a dark rounded icon with green level number."""
-        size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        # Dark rounded background
-        draw.rounded_rectangle([2, 2, 62, 62], radius=12, fill=(30, 30, 30, 230))
-
-        # Green number
-        try:
-            font = ImageFont.truetype("arialbd.ttf", 26)
-        except Exception:
-            try:
-                font = ImageFont.truetype("arial.ttf", 26)
-            except Exception:
-                font = ImageFont.load_default()
-        text = str(level)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        tx = (size - tw) // 2 - bbox[0]
-        ty = (size - th) // 2 - bbox[1]
-        draw.text((tx, ty), text, fill=(80, 220, 80, 255), font=font)
-
-        return img
+    def _make_icon_image(self, brightness: int, warmth: int = 0) -> Image.Image:
+        """Delegate to the pure module-level drawer (keeps class API small)."""
+        return _make_tray_icon_image(brightness, warmth)
 
     def _create_icon(self):
-        img = self._make_icon_image(self.brightness)
+        img = self._make_icon_image(self.brightness, self.warmth)
 
         def on_quit(icon, item):
             icon.stop()
@@ -457,9 +579,10 @@ class BrightnessApp:
         ]
 
         menu = pystray.Menu(
+            item("Open sliders…", lambda i, it: self.slider.request_show()),
+            pystray.Menu.SEPARATOR,
             item("☀ Brightness", pystray.Menu(*brightness_items)),
             item("🌅 Warmth", pystray.Menu(*warmth_items)),
-            item("Open sliders…", lambda i, it: self.slider.request_show()),
             pystray.Menu.SEPARATOR,
             item(lambda _: f"Current: {self.brightness}% · warm {self.warmth}%",
                  lambda i, it: None, enabled=False),
@@ -489,9 +612,12 @@ class BrightnessApp:
         ok = set_brightness(self.brightness, self.warmth)
         _save_settings(self.brightness, self.warmth)
         status = "✓" if ok else "✗ GDI failed"
-        self.icon.icon = self._make_icon_image(self.brightness)
+        self.icon.icon = self._make_icon_image(self.brightness, self.warmth)
         self.icon.title = f"NVIDIA Brightness: {self.brightness}% · warm {self.warmth}% {status}"
-        self.icon.update_menu()  # re-render dynamic "Current" label + radio checkmarks
+        try:
+            self.icon.update_menu()
+        except Exception:
+            pass
         print(f"Brightness → {self.brightness}%  Warmth → {self.warmth}% ({status})")
 
     def _step(self, delta: int):
