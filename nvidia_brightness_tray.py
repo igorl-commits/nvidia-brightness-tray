@@ -150,20 +150,58 @@ def _load_settings(default_brightness: int = 91, default_warmth: int = 0):
         return default_brightness, default_warmth
 
 
-def _save_settings(brightness: int, warmth: int) -> None:
-    """Persist brightness + warmth for next app launch."""
+def _read_settings_raw() -> dict:
+    """Read the whole settings dict (so writes can merge, not clobber)."""
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_settings_raw(data: dict) -> None:
     try:
         os.makedirs(SETTINGS_DIR, exist_ok=True)
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "brightness": int(max(10, min(100, brightness))),
-                    "warmth": int(max(0, min(100, warmth))),
-                },
-                f,
-            )
+            json.dump(data, f)
     except Exception:
         pass
+
+
+def _save_settings(brightness: int, warmth: int) -> None:
+    """Persist brightness + warmth, preserving other keys (e.g. window_pos)."""
+    data = _read_settings_raw()
+    data["brightness"] = int(max(10, min(100, brightness)))
+    data["warmth"] = int(max(0, min(100, warmth)))
+    _write_settings_raw(data)
+
+
+def _load_window_pos():
+    """Return saved (x, y) of the slider window, or None if never saved."""
+    pos = _read_settings_raw().get("window_pos")
+    try:
+        return int(pos[0]), int(pos[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _save_window_pos(x: int, y: int) -> None:
+    data = _read_settings_raw()
+    data["window_pos"] = [int(x), int(y)]
+    _write_settings_raw(data)
+
+
+def _work_area():
+    """Desktop rect minus taskbar as (left, top, right, bottom)."""
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+    r = RECT()
+    SPI_GETWORKAREA = 0x0030
+    if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(r), 0):
+        return r.left, r.top, r.right, r.bottom
+    return None
 
 
 def _make_tray_icon_image(brightness: int, warmth: int = 0) -> "Image.Image":
@@ -371,6 +409,29 @@ def _is_windows_dark_theme() -> bool:
         return True  # default dark
 
 
+def _enable_system_theme_menus() -> None:
+    """Opt the process into dark-mode-aware controls so the native tray
+    context menu follows the system light/dark setting.
+
+    Native Win32 popup menus render light by default; the process must opt
+    in via undocumented uxtheme.dll ordinals (stable since Win10 1903):
+      135 = SetPreferredAppMode(PreferredAppMode)  -> 1 = AllowDark (follow system)
+      136 = FlushMenuThemes()                      -> repaint themed menus
+    """
+    try:
+        uxtheme = ctypes.WinDLL("uxtheme.dll")
+        set_preferred_app_mode = uxtheme[135]
+        set_preferred_app_mode.argtypes = [ctypes.c_int]
+        set_preferred_app_mode.restype = ctypes.c_int
+        set_preferred_app_mode(1)  # AllowDark = honor system theme, both ways
+        flush_menu_themes = uxtheme[136]
+        flush_menu_themes.argtypes = []
+        flush_menu_themes.restype = None
+        flush_menu_themes()
+    except Exception as e:
+        print(f"Could not enable system-theme menus: {e}")
+
+
 # ─── SLIDER WINDOW (TKINTER) ──────────────────────────────────────────────────
 
 class SliderWindow:
@@ -425,19 +486,19 @@ class SliderWindow:
         except Exception:
             pass
 
-        # Very thin modern sliders
+        # Very thin modern sliders (2x thinner)
         style.configure("ThinB.Horizontal.TScale", background=bg, troughcolor="#3a3a3a" if self._is_dark else "#d0d0d0",
-                        sliderlength=10, sliderthickness=5)
+                        sliderlength=8, sliderthickness=2)
         style.configure("ThinW.Horizontal.TScale", background=bg, troughcolor="#3a3a3a" if self._is_dark else "#d0d0d0",
-                        sliderlength=10, sliderthickness=5)
+                        sliderlength=8, sliderthickness=2)
 
         b0, w0 = self.get_state()
         self.b_var = tk.IntVar(value=b0)
         self.w_var = tk.IntVar(value=w0)
 
         # Only B and W labels (big, clear)
-        self.b_label = tk.Label(self.root, text="B", bg=bg, fg=accent_b, font=("Segoe UI", 18, "bold"))
-        self.w_label = tk.Label(self.root, text="W", bg=bg, fg=accent_w, font=("Segoe UI", 18, "bold"))
+        self.b_label = tk.Label(self.root, text="B", bg=bg, fg=accent_b, font=("Segoe UI", 11, "bold"))
+        self.w_label = tk.Label(self.root, text="W", bg=bg, fg=accent_w, font=("Segoe UI", 11, "bold"))
 
         self.b_value = tk.Label(self.root, text=f"{b0}%", bg=bg, fg=fg, font=("Segoe UI", 11))
         self.w_value = tk.Label(self.root, text=f"{w0}%", bg=bg, fg=fg, font=("Segoe UI", 11))
@@ -458,9 +519,9 @@ class SliderWindow:
         self.w_scale.grid(row=1, column=1, padx=2, pady=(1, 6), sticky="ew")
         self.w_value.grid(row=1, column=2, padx=(3, 10), pady=(1, 6))
 
-        # Subtle preview bar
+        # Subtle preview bar (2x thinner)
         preview_bg = "#2a2a2a" if self._is_dark else "#e8e8e8"
-        self.preview = tk.Canvas(self.root, width=260, height=14, bg=preview_bg,
+        self.preview = tk.Canvas(self.root, width=130, height=7, bg=preview_bg,
                                  highlightthickness=0, bd=0)
         self.preview.grid(row=2, column=0, columnspan=3, padx=10, pady=(0, 8), sticky="ew")
 
@@ -497,8 +558,8 @@ class SliderWindow:
 
         c = self.preview
         c.delete("all")
-        width = c.winfo_width() or 260
-        height = 14
+        width = c.winfo_width() or 130
+        height = 7
 
         for x in range(width):
             warmth_influence = w / 100.0
@@ -519,29 +580,68 @@ class SliderWindow:
         self.b_var.set(b)
         self.w_var.set(w)
         self._syncing = False
+        self._position_window()   # set geometry while withdrawn -> no flicker/reset
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
-
-        try:
-            self.root.grab_set()
-        except Exception:
-            pass
+        # borderless (overrideredirect) windows don't grab focus on their own;
+        # force it so <FocusOut> fires when the user clicks away
+        self.root.focus_force()
 
         self.root.bind("<FocusOut>", self._on_focus_out, add="+")
         self.root.after(50, lambda: self._update_preview_and_labels(b, w))
 
+    def _position_window(self):
+        """Place at last saved spot, else above the tray icon (bottom-right)."""
+        self.root.update_idletasks()
+        # reqwidth/reqheight = layout size; winfo_width is 1 until first mapped
+        w = self.root.winfo_reqwidth()
+        h = self.root.winfo_reqheight()
+        area = _work_area()
+
+        pos = _load_window_pos()
+        if pos is not None:
+            x, y = pos
+        elif area is not None:
+            left, top, right, bottom = area
+            x = right - w - 12          # hug right edge, above the tray
+            y = bottom - h - 12         # sit just above the taskbar
+        else:
+            x, y = 100, 100
+
+        if area is not None:            # clamp so it stays on-screen
+            left, top, right, bottom = area
+            x = max(left, min(x, right - w))
+            y = max(top, min(y, bottom - h))
+
+        self.root.geometry(f"+{x}+{y}")
+
     def _on_focus_out(self, event):
+        # FocusOut also fires when focus moves between the window's own
+        # children (e.g. clicking a slider). Only hide when focus actually
+        # left the app: focus_get() is None when no widget here has focus.
         if self.root:
-            self.root.after(60, self._hide)
+            self.root.after(60, self._hide_if_unfocused)
+
+    def _hide_if_unfocused(self):
+        if self.root and self.root.focus_get() is None:
+            self._hide()
 
     def _hide(self):
         if self.root:
+            try:
+                self._save_pos()
+            except Exception:
+                pass
             try:
                 self.root.grab_release()
             except Exception:
                 pass
             self.root.withdraw()
+
+    def _save_pos(self):
+        if self.root and self.root.winfo_exists():
+            _save_window_pos(self.root.winfo_x(), self.root.winfo_y())
 
     def request_show(self):
         if self.root is None:
@@ -756,6 +856,8 @@ if __name__ == "__main__":
         print("Note: Run as Administrator if brightness changes don't apply.")
 
     first_run = not os.path.exists(SETTINGS_PATH)
+
+    _enable_system_theme_menus()  # native tray menu follows system dark/light
 
     app = BrightnessApp()  # writes settings.json, so after this first_run is consumed
 

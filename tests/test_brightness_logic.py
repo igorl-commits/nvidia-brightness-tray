@@ -69,3 +69,29 @@ def test_settings_clamped_on_save_load(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "SETTINGS_DIR", str(tmp_path))
     app._save_settings(500, -10)
     assert app._load_settings() == (100, 0)
+
+
+# ─── TRAY ICON (pure drawing function, testable without display) ─────────────
+
+def test_tray_icon_returns_valid_image():
+    img = app._make_tray_icon_image(80, 0)
+    assert img.size == (64, 64)
+    assert img.mode == "RGBA"
+
+
+def test_tray_icon_various_inputs():
+    for b in (10, 55, 100):
+        for w in (0, 30, 100):
+            img = app._make_tray_icon_image(b, w)
+            assert img.size == (64, 64)
+
+
+def test_tray_icon_no_warmth_bar_when_zero():
+    """When warmth=0 the warmth bar area must be dark (no amber fill drawn)."""
+    img = app._make_tray_icon_image(75, 0)
+    px = img.load()
+    # Sample center of the bar track area (should be dark background)
+    # x=32 is middle, y=54 is inside the bar zone
+    r, g, b, a = px[32, 54]
+    brightness = (r + g + b) / 3
+    assert brightness < 50, f"Expected dark bar area, got brightness {brightness}"
