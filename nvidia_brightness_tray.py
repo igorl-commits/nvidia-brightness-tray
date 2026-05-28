@@ -1,8 +1,10 @@
 """
 NVIDIA Brightness Tray App
 --------------------------
-Sits in system tray, lets you adjust NVIDIA display brightness
-via slider, hotkeys, or presets — no Control Panel needed.
+Sits in system tray, lets you adjust display brightness and color
+temperature (warmth) via a popup slider window, menu presets, or
+hotkeys — no Control Panel needed. Re-applies the gamma ramp after
+sleep/resume and display changes (e.g. exiting fullscreen games).
 
 Requirements:
     pip install pystray pillow keyboard pywin32
@@ -11,7 +13,8 @@ Run:
     pythonw nvidia_brightness_tray.py   (no console window)
     python  nvidia_brightness_tray.py   (with console for debugging)
 
-Auto-start: Add a shortcut to shell:startup (Win+R → shell:startup)
+Auto-start: toggle "Start with Windows" in the tray menu (creates/removes
+a shortcut in shell:startup). Created automatically on first launch.
 """
 
 import sys
@@ -48,14 +51,6 @@ except ImportError:
 
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-
-PRESETS = {
-    "Night (30%)":  30,
-    "Dim (50%)":    50,
-    "Normal (75%)": 75,
-    "Bright (91%)": 91,   # your current NVIDIA setting
-    "Full (100%)":  100,
-}
 
 # Register multiple aliases because keyboard layouts and numpad naming differ.
 HOTKEY_UP_BINDINGS = [
@@ -178,6 +173,7 @@ PBT_APMSUSPEND = 0x0004
 PBT_APMRESUMESUSPEND = 0x0007
 PBT_APMRESUMEAUTOMATIC = 0x0012
 WM_DESTROY = 0x0002
+WM_DISPLAYCHANGE = 0x007E
 
 
 def _start_power_event_listener(on_resume_callback):
@@ -253,6 +249,12 @@ def _start_power_event_listener(on_resume_callback):
                     except Exception:
                         pass
                 return 1
+            if msg == WM_DISPLAYCHANGE:
+                try:
+                    on_resume_callback()
+                except Exception:
+                    pass
+                return 0
             if msg == WM_DESTROY:
                 user32.PostQuitMessage(0)
                 return 0
@@ -295,14 +297,92 @@ def _start_power_event_listener(on_resume_callback):
     return t
 
 
+# ─── SLIDER WINDOW (TKINTER) ──────────────────────────────────────────────────
+
+class SliderWindow:
+    """
+    Hidden Tk root on its own daemon thread. Shown on demand via the
+    thread-safe `event_generate` call. Sliders drive on_change(brightness, warmth).
+    """
+
+    def __init__(self, on_change, get_state):
+        self.on_change = on_change      # callable(brightness:int, warmth:int)
+        self.get_state = get_state      # callable() -> (brightness:int, warmth:int)
+        self.root = None
+        self._syncing = False
+        self._tk = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            import tkinter as tk
+        except Exception as e:
+            print(f"Tkinter unavailable — sliders disabled: {e}")
+            return
+        self._tk = tk
+        self.root = tk.Tk()
+        self.root.title("Display")
+        self.root.resizable(False, False)
+        self.root.attributes("-topmost", True)
+
+        b0, w0 = self.get_state()
+        self.b_var = tk.IntVar(value=b0)
+        self.w_var = tk.IntVar(value=w0)
+
+        tk.Scale(self.root, label="Brightness", from_=10, to=100,
+                 orient=tk.HORIZONTAL, length=240, variable=self.b_var,
+                 command=self._on_slider).pack(padx=12, pady=(10, 4))
+        tk.Scale(self.root, label="Warmth", from_=0, to=100,
+                 orient=tk.HORIZONTAL, length=240, variable=self.w_var,
+                 command=self._on_slider).pack(padx=12, pady=(4, 12))
+
+        self.root.protocol("WM_DELETE_WINDOW", self._hide)
+        self.root.bind("<<ShowSliders>>", lambda e: self._show())
+        self.root.withdraw()
+        self.root.mainloop()
+
+    def _on_slider(self, _value=None):
+        if self._syncing:
+            return
+        self.on_change(self.b_var.get(), self.w_var.get())
+
+    def _show(self):
+        self._syncing = True
+        b, w = self.get_state()
+        self.b_var.set(b)
+        self.w_var.set(w)
+        self._syncing = False
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+
+    def _hide(self):
+        if self.root:
+            self.root.withdraw()
+
+    def request_show(self):
+        if self.root is None:
+            return
+        try:
+            self.root.event_generate("<<ShowSliders>>", when="tail")
+        except Exception as e:
+            print(f"Could not open sliders: {e}")
+
+
 # ─── TRAY ICON ────────────────────────────────────────────────────────────────
 
 class BrightnessApp:
     def __init__(self):
-        self.brightness = _load_saved_brightness(default=91)
-        set_brightness(self.brightness)
+        self.brightness, self.warmth = _load_settings()
+        set_brightness(self.brightness, self.warmth)
+        _save_settings(self.brightness, self.warmth)  # ensure settings.json exists after first launch
         self.icon = self._create_icon()
         self._resume_reapply_lock = threading.Lock()
+        self.slider = SliderWindow(
+            on_change=lambda b, w: self._apply(brightness=b, warmth=w),
+            get_state=lambda: (self.brightness, self.warmth),
+        )
 
     def _reapply_after_resume(self):
         # Resume can happen before the display driver is fully ready.
@@ -312,7 +392,7 @@ class BrightnessApp:
         try:
             time.sleep(1.0)
             for _ in range(6):
-                if set_brightness(self.brightness):
+                if set_brightness(self.brightness, self.warmth):
                     self.icon.title = f"NVIDIA Brightness: {self.brightness}% ✓"
                     return
                 time.sleep(0.5)
@@ -353,45 +433,74 @@ class BrightnessApp:
         def on_quit(icon, item):
             icon.stop()
 
-        def make_preset_handler(val):
-            def handler(icon, item):
-                self._apply(val)
-            return handler
+        BRIGHTNESS_STEPS = list(range(100, 0, -10))  # 100,90,...,10
+        WARMTH_PRESETS = [("Off", 0), ("Low", 25), ("Medium", 50),
+                          ("High", 75), ("Max", 100)]
 
-        preset_items = [
-            item(label, make_preset_handler(val))
-            for label, val in PRESETS.items()
+        def make_b_handler(val):
+            return lambda i, it: self._apply(brightness=val)
+
+        def make_w_handler(val):
+            return lambda i, it: self._apply(warmth=val)
+
+        brightness_items = [
+            item(f"{v}%", make_b_handler(v),
+                 checked=lambda it, v=v: round(self.brightness / 10) * 10 == v,
+                 radio=True)
+            for v in BRIGHTNESS_STEPS
+        ]
+        warmth_items = [
+            item(f"{label} ({v}%)", make_w_handler(v),
+                 checked=lambda it, v=v: self.warmth == v,
+                 radio=True)
+            for label, v in WARMTH_PRESETS
         ]
 
         menu = pystray.Menu(
-            item("☀ Brightness", pystray.Menu(*preset_items)),
+            item("☀ Brightness", pystray.Menu(*brightness_items)),
+            item("🌅 Warmth", pystray.Menu(*warmth_items)),
+            item("Open sliders…", lambda i, it: self.slider.request_show()),
             pystray.Menu.SEPARATOR,
-            item(lambda _: f"Current: {self.brightness}%", lambda i, it: None, enabled=False),
+            item(lambda _: f"Current: {self.brightness}% · warm {self.warmth}%",
+                 lambda i, it: None, enabled=False),
             pystray.Menu.SEPARATOR,
-            item("Brighter  (Ctrl+Alt +/+)", lambda i, it: self._step(+STEP)),
-            item("Dimmer    (Ctrl+Alt -/-)", lambda i, it: self._step(-STEP)),
+            item("Brighter  (Ctrl+Alt +)", lambda i, it: self._step(+STEP)),
+            item("Dimmer    (Ctrl+Alt -)", lambda i, it: self._step(-STEP)),
+            item("Reset display (100%, no warmth)",
+                 lambda i, it: self._apply(brightness=100, warmth=0)),
             pystray.Menu.SEPARATOR,
+            item("Start with Windows", self._toggle_autostart,
+                 checked=lambda it: is_autostart_enabled()),
             item("Quit", on_quit),
         )
 
         return pystray.Icon(
             "nvidia_brightness",
             img,
-            f"NVIDIA Brightness: {self.brightness}%",
+            f"NVIDIA Brightness: {self.brightness}% · warm {self.warmth}%",
             menu,
         )
 
-    def _apply(self, level: int):
-        self.brightness = max(10, min(100, level))
-        ok = set_brightness(self.brightness)
-        _save_brightness(self.brightness)
+    def _apply(self, brightness=None, warmth=None):
+        if brightness is not None:
+            self.brightness = max(10, min(100, int(brightness)))
+        if warmth is not None:
+            self.warmth = max(0, min(100, int(warmth)))
+        ok = set_brightness(self.brightness, self.warmth)
+        _save_settings(self.brightness, self.warmth)
         status = "✓" if ok else "✗ GDI failed"
         self.icon.icon = self._make_icon_image(self.brightness)
-        self.icon.title = f"NVIDIA Brightness: {self.brightness}% {status}"
-        print(f"Brightness → {self.brightness}% ({status})")
+        self.icon.title = f"NVIDIA Brightness: {self.brightness}% · warm {self.warmth}% {status}"
+        print(f"Brightness → {self.brightness}%  Warmth → {self.warmth}% ({status})")
 
     def _step(self, delta: int):
-        self._apply(self.brightness + delta)
+        self._apply(brightness=self.brightness + delta)
+
+    def _toggle_autostart(self, icon, item):
+        if is_autostart_enabled():
+            disable_autostart()
+        else:
+            enable_autostart()
 
     def _setup_hotkeys(self):
         if not HAS_KEYBOARD:
@@ -429,14 +538,21 @@ class BrightnessApp:
 
 # ─── ENTRY ───────────────────────────────────────────────────────────────────
 
-def _ensure_autostart():
-    """Create a startup shortcut if one doesn't exist yet."""
-    import os
+def _startup_lnk_path() -> str:
     startup_dir = os.path.join(
         os.environ.get("APPDATA", ""),
         r"Microsoft\Windows\Start Menu\Programs\Startup",
     )
-    lnk_path = os.path.join(startup_dir, "NvidiaBrightnessTray.lnk")
+    return os.path.join(startup_dir, "NvidiaBrightnessTray.lnk")
+
+
+def is_autostart_enabled() -> bool:
+    return os.path.exists(_startup_lnk_path())
+
+
+def enable_autostart() -> None:
+    """Create the startup shortcut if missing."""
+    lnk_path = _startup_lnk_path()
     if os.path.exists(lnk_path):
         return
     try:
@@ -454,9 +570,20 @@ def _ensure_autostart():
         import subprocess
         subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True,
                        capture_output=True)
-        print(f"Auto-start shortcut created: {lnk_path}")
+        print(f"Auto-start enabled: {lnk_path}")
     except Exception as e:
-        print(f"Could not create auto-start shortcut: {e}")
+        print(f"Could not enable auto-start: {e}")
+
+
+def disable_autostart() -> None:
+    """Remove the startup shortcut if present."""
+    lnk_path = _startup_lnk_path()
+    try:
+        if os.path.exists(lnk_path):
+            os.remove(lnk_path)
+            print(f"Auto-start disabled: {lnk_path}")
+    except Exception as e:
+        print(f"Could not disable auto-start: {e}")
 
 
 if __name__ == "__main__":
@@ -464,7 +591,11 @@ if __name__ == "__main__":
     if ctypes.windll.shell32.IsUserAnAdmin() == 0:
         print("Note: Run as Administrator if brightness changes don't apply.")
 
-    _ensure_autostart()
+    first_run = not os.path.exists(SETTINGS_PATH)
 
-    app = BrightnessApp()
+    app = BrightnessApp()  # writes settings.json, so after this first_run is consumed
+
+    if first_run:
+        enable_autostart()
+
     app.run()
