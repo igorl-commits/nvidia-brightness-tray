@@ -6,8 +6,12 @@ temperature (warmth) via a popup slider window, menu presets, or
 hotkeys — no Control Panel needed. Re-applies the gamma ramp after
 sleep/resume and display changes (e.g. exiting fullscreen games).
 
+Hotkeys are registered with the Win32 RegisterHotKey API (Ctrl+Alt +/-),
+which is owned by the OS and survives sleep/resume — unlike a low-level
+keyboard hook, which Windows silently tears down across suspend.
+
 Requirements:
-    pip install pystray pillow keyboard pywin32
+    pip install pystray pillow pywin32
 
 Run:
     pythonw nvidia_brightness_tray.py   (no console window)
@@ -35,13 +39,6 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import keyboard
-    HAS_KEYBOARD = True
-except ImportError:
-    HAS_KEYBOARD = False
-    print("'keyboard' not installed — hotkeys disabled. pip install keyboard")
-
-try:
     import win32api
     import win32con
     HAS_WIN32 = True
@@ -52,19 +49,39 @@ except ImportError:
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-# Register multiple aliases because keyboard layouts and numpad naming differ.
-HOTKEY_UP_BINDINGS = [
-    "ctrl+alt+=",
-    "ctrl+alt++",
-    "ctrl+alt+plus",
-    "ctrl+alt+add",
-]
-HOTKEY_DOWN_BINDINGS = [
-    "ctrl+alt+-",
-    "ctrl+alt+minus",
-    "ctrl+alt+subtract",
-]
 STEP = 10
+
+# ─── GLOBAL HOTKEYS (Win32 RegisterHotKey) ───────────────────────────────────
+# RegisterHotKey is OS-owned system state: it survives sleep/resume and is not
+# subject to the low-level-hook timeout teardown that breaks `keyboard`-style
+# hooks after the machine wakes. The combo is consumed by the OS (no separate
+# "suppress" needed). Each combo posts WM_HOTKEY (with our id in wParam) to the
+# thread that registered it — here, the power-event message loop.
+
+WM_HOTKEY = 0x0312
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+# Virtual-key codes for the +/- keys, main row and numpad (layouts/numpad differ).
+VK_OEM_PLUS = 0xBB   # '=' / '+' on the main row
+VK_OEM_MINUS = 0xBD  # '-' / '_' on the main row
+VK_ADD = 0x6B        # numpad '+'
+VK_SUBTRACT = 0x6D   # numpad '-'
+
+
+def _build_hotkey_table(on_brighter, on_dimmer):
+    """Map a stable hotkey id -> (modifiers, virtual_key, handler).
+
+    Pure function (no Win32 calls) so the id->handler dispatch is unit-testable.
+    Ctrl+Alt with several +/- variants so it works regardless of which +/- key
+    the user presses (main row vs numpad).
+    """
+    mods = MOD_CONTROL | MOD_ALT
+    return {
+        1: (mods, VK_OEM_PLUS, on_brighter),
+        2: (mods, VK_ADD, on_brighter),
+        3: (mods, VK_OEM_MINUS, on_dimmer),
+        4: (mods, VK_SUBTRACT, on_dimmer),
+    }
 
 SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", ""), "NvidiaBrightnessTray")
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
@@ -273,11 +290,17 @@ WM_DESTROY = 0x0002
 WM_DISPLAYCHANGE = 0x007E
 
 
-def _start_power_event_listener(on_resume_callback):
+def _start_power_event_listener(on_resume_callback, hotkey_table=None):
     """
-    Start a background thread that listens for Windows power events.
-    When the system resumes, call on_resume_callback().
+    Start a background thread that owns a hidden window + message loop.
+
+    It listens for Windows power/display events (calling on_resume_callback when
+    the system resumes or the display changes) and, if hotkey_table is given,
+    registers those global hotkeys via RegisterHotKey and dispatches their
+    handlers on WM_HOTKEY. Hotkeys live on this thread because WM_HOTKEY is
+    delivered to the thread that registered them.
     """
+    hotkey_table = hotkey_table or {}
 
     # Ensure correct 64-bit types (prevents LPARAM overflow on modern Windows).
     LRESULT_T = ctypes.c_int64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
@@ -336,9 +359,21 @@ def _start_power_event_listener(on_resume_callback):
         user32.TranslateMessage.restype = wintypes.BOOL
         user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
         user32.DispatchMessageW.restype = LRESULT_T
+        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.UnregisterHotKey.restype = wintypes.BOOL
 
         @WNDPROCTYPE
         def wndproc(hwnd, msg, wparam, lparam):
+            if msg == WM_HOTKEY:
+                entry = hotkey_table.get(int(wparam))
+                if entry:
+                    try:
+                        entry[2]()   # (modifiers, vk, handler)
+                    except Exception:
+                        pass
+                return 0
             if msg == WM_POWERBROADCAST:
                 if wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
                     try:
@@ -384,10 +419,22 @@ def _start_power_event_listener(on_resume_callback):
         if not hwnd:
             return
 
-        msg_obj = MSG()
-        while user32.GetMessageW(ctypes.byref(msg_obj), None, 0, 0) != 0:
-            user32.TranslateMessage(ctypes.byref(msg_obj))
-            user32.DispatchMessageW(ctypes.byref(msg_obj))
+        # Register global hotkeys on this thread so WM_HOTKEY lands in wndproc.
+        registered = []
+        for hk_id, (mods, vk, _handler) in hotkey_table.items():
+            if user32.RegisterHotKey(hwnd, hk_id, mods, vk):
+                registered.append(hk_id)
+        if hotkey_table:
+            print(f"Hotkeys registered: {len(registered)}/{len(hotkey_table)} combos")
+
+        try:
+            msg_obj = MSG()
+            while user32.GetMessageW(ctypes.byref(msg_obj), None, 0, 0) != 0:
+                user32.TranslateMessage(ctypes.byref(msg_obj))
+                user32.DispatchMessageW(ctypes.byref(msg_obj))
+        finally:
+            for hk_id in registered:
+                user32.UnregisterHotKey(hwnd, hk_id)
 
     t = threading.Thread(target=_thread_main, daemon=True)
     t.start()
@@ -766,34 +813,15 @@ class BrightnessApp:
         else:
             enable_autostart()
 
-    def _setup_hotkeys(self):
-        if not HAS_KEYBOARD:
-            return
-        registered = []
-        for hk in HOTKEY_UP_BINDINGS:
-            try:
-                keyboard.add_hotkey(hk, lambda: self._step(+STEP), suppress=True)
-                registered.append(hk)
-            except Exception:
-                pass
-        for hk in HOTKEY_DOWN_BINDINGS:
-            try:
-                keyboard.add_hotkey(hk, lambda: self._step(-STEP), suppress=True)
-                registered.append(hk)
-            except Exception:
-                pass
-        if registered:
-            print(f"Hotkeys registered: {', '.join(registered)}")
-        else:
-            print("No hotkeys were registered.")
-
     def run(self):
-        # Hotkeys in background thread
-        if HAS_KEYBOARD:
-            t = threading.Thread(target=self._setup_hotkeys, daemon=True)
-            t.start()
-
-        _start_power_event_listener(self._reapply_after_resume)
+        # One background thread owns the message loop: power/display events
+        # AND global hotkeys. RegisterHotKey-based hotkeys survive sleep/resume,
+        # so there's nothing to re-arm on wake.
+        hotkey_table = _build_hotkey_table(
+            on_brighter=lambda: self._step(+STEP),
+            on_dimmer=lambda: self._step(-STEP),
+        )
+        _start_power_event_listener(self._reapply_after_resume, hotkey_table)
 
         print(f"Tray running. Brightness: {self.brightness}%")
         print("Hotkeys: Ctrl+Alt plus (up), Ctrl+Alt minus (down)")
