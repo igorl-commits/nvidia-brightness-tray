@@ -71,6 +71,18 @@ def test_settings_clamped_on_save_load(tmp_path, monkeypatch):
     assert app._load_settings() == (100, 0)
 
 
+def test_settings_write_is_atomic(tmp_path, monkeypatch):
+    p = tmp_path / "settings.json"
+    monkeypatch.setattr(app, "SETTINGS_PATH", str(p))
+    monkeypatch.setattr(app, "SETTINGS_DIR", str(tmp_path))
+    app._save_settings(70, 35)
+    assert json.loads(p.read_text(encoding="utf-8")) == {
+        "brightness": 70,
+        "warmth": 35,
+    }
+    assert not (tmp_path / "settings.json.tmp").exists()
+
+
 # ─── TRAY ICON (pure drawing function, testable without display) ─────────────
 
 def test_tray_icon_returns_valid_image():

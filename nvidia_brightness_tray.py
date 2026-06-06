@@ -2,16 +2,16 @@
 NVIDIA Brightness Tray App
 --------------------------
 Sits in system tray, lets you adjust display brightness and color
-temperature (warmth) via a popup slider window, menu presets, or
-hotkeys — no Control Panel needed. Re-applies the gamma ramp after
-sleep/resume and display changes (e.g. exiting fullscreen games).
+temperature (warmth) via menu presets and hotkeys — no Control Panel
+needed. Re-applies the gamma ramp after sleep/resume and display changes
+(e.g. exiting fullscreen games).
 
 Hotkeys are registered with the Win32 RegisterHotKey API (Ctrl+Alt +/-),
 which is owned by the OS and survives sleep/resume — unlike a low-level
 keyboard hook, which Windows silently tears down across suspend.
 
 Requirements:
-    pip install pystray pillow pywin32
+    pip install pystray pillow
 
 Run:
     pythonw nvidia_brightness_tray.py   (no console window)
@@ -37,14 +37,6 @@ try:
 except ImportError:
     print("Missing deps. Run: pip install pystray pillow")
     sys.exit(1)
-
-try:
-    import win32api
-    import win32con
-    HAS_WIN32 = True
-except ImportError:
-    HAS_WIN32 = False
-    print("'pywin32' not installed — some advanced features disabled. pip install pywin32")
 
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -85,6 +77,8 @@ def _build_hotkey_table(on_brighter, on_dimmer):
 
 SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", ""), "NvidiaBrightnessTray")
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
+_settings_lock = threading.RLock()
+_instance_mutex = None
 
 # ─── GAMMA / BRIGHTNESS VIA GDI ──────────────────────────────────────────────
 # Windows GDI SetDeviceGammaRamp works at the driver level — same effect as
@@ -138,87 +132,40 @@ def set_brightness(brightness_pct: int, warmth_pct: int = 0) -> bool:
     _release_dc(hdc)
     return bool(result)
 
-def get_current_brightness() -> int:
-    """Read current gamma ramp and estimate brightness %."""
-    hdc = _get_primary_dc()
-    if not hdc:
-        return 100
-    GammaArray = ctypes.c_uint16 * (3 * 256)
-    gamma = GammaArray()
-    ok = gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(gamma))
-    _release_dc(hdc)
-    if not ok:
-        return 100
-    # Sample midpoint of red channel to estimate level
-    mid = gamma[128]  # index 128 in red channel
-    approx = int((mid / 65535) * 100 / (128/255))
-    return max(10, min(100, approx))
-
-
 def _load_settings(default_brightness: int = 91, default_warmth: int = 0):
     """Load (brightness, warmth) from disk. Missing warmth key -> 0 (old format)."""
-    try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        b = int(data.get("brightness", default_brightness))
-        w = int(data.get("warmth", default_warmth))
-        return max(10, min(100, b)), max(0, min(100, w))
-    except Exception:
-        return default_brightness, default_warmth
+    with _settings_lock:
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            b = int(data.get("brightness", default_brightness))
+            w = int(data.get("warmth", default_warmth))
+            return max(10, min(100, b)), max(0, min(100, w))
+        except Exception:
+            return default_brightness, default_warmth
 
 
-def _read_settings_raw() -> dict:
-    """Read the whole settings dict (so writes can merge, not clobber)."""
-    try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _write_settings_raw(data: dict) -> None:
+def _write_settings_raw_unlocked(data: dict) -> None:
+    temp_path = f"{SETTINGS_PATH}.tmp"
     try:
         os.makedirs(SETTINGS_DIR, exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f)
+        os.replace(temp_path, SETTINGS_PATH)
     except Exception:
-        pass
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
 
 
 def _save_settings(brightness: int, warmth: int) -> None:
-    """Persist brightness + warmth, preserving other keys (e.g. window_pos)."""
-    data = _read_settings_raw()
-    data["brightness"] = int(max(10, min(100, brightness)))
-    data["warmth"] = int(max(0, min(100, warmth)))
-    _write_settings_raw(data)
-
-
-def _load_window_pos():
-    """Return saved (x, y) of the slider window, or None if never saved."""
-    pos = _read_settings_raw().get("window_pos")
-    try:
-        return int(pos[0]), int(pos[1])
-    except (TypeError, ValueError, IndexError):
-        return None
-
-
-def _save_window_pos(x: int, y: int) -> None:
-    data = _read_settings_raw()
-    data["window_pos"] = [int(x), int(y)]
-    _write_settings_raw(data)
-
-
-def _work_area():
-    """Desktop rect minus taskbar as (left, top, right, bottom)."""
-    class RECT(ctypes.Structure):
-        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-    r = RECT()
-    SPI_GETWORKAREA = 0x0030
-    if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(r), 0):
-        return r.left, r.top, r.right, r.bottom
-    return None
+    """Persist brightness + warmth atomically."""
+    with _settings_lock:
+        _write_settings_raw_unlocked({
+            "brightness": int(max(10, min(100, brightness))),
+            "warmth": int(max(0, min(100, warmth))),
+        })
 
 
 def _make_tray_icon_image(brightness: int, warmth: int = 0) -> "Image.Image":
@@ -283,7 +230,6 @@ def _make_tray_icon_image(brightness: int, warmth: int = 0) -> "Image.Image":
 # ─── POWER RESUME HANDLING (RE-APPLY GAMMA RAMP) ──────────────────────────────
 
 WM_POWERBROADCAST = 0x0218
-PBT_APMSUSPEND = 0x0004
 PBT_APMRESUMESUSPEND = 0x0007
 PBT_APMRESUMEAUTOMATIC = 0x0012
 WM_DESTROY = 0x0002
@@ -441,21 +387,6 @@ def _start_power_event_listener(on_resume_callback, hotkey_table=None):
     return t
 
 
-def _is_windows_dark_theme() -> bool:
-    """Detect if Windows is using dark theme for apps (0 = dark)."""
-    try:
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-        )
-        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-        winreg.CloseKey(key)
-        return value == 0
-    except Exception:
-        return True  # default dark
-
-
 def _enable_system_theme_menus() -> None:
     """Opt the process into dark-mode-aware controls so the native tray
     context menu follows the system light/dark setting.
@@ -479,239 +410,16 @@ def _enable_system_theme_menus() -> None:
         print(f"Could not enable system-theme menus: {e}")
 
 
-# ─── SLIDER WINDOW (TKINTER) ──────────────────────────────────────────────────
-
-class SliderWindow:
-    """
-    Hidden Tk root on its own daemon thread. Shown on demand via the
-    thread-safe `event_generate` call. Sliders drive on_change(brightness, warmth).
-    """
-
-    def __init__(self, on_change, get_state):
-        self.on_change = on_change      # callable(brightness:int, warmth:int)
-        self.get_state = get_state      # callable() -> (brightness:int, warmth:int)
-        self.root = None
-        self._syncing = False
-        self._tk = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        try:
-            import tkinter as tk
-            from tkinter import ttk
-        except Exception as e:
-            print(f"Tkinter unavailable — sliders disabled: {e}")
-            return
-
-        self._tk = tk
-        self.root = tk.Tk()
-
-        # Glass / borderless modern look (no borders, draggable)
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.resizable(False, False)
-
-        # Detect and apply system theme
-        self._is_dark = _is_windows_dark_theme()
-
-        bg = "#1f1f1f" if self._is_dark else "#f3f3f3"
-        fg = "#e0e0e0" if self._is_dark else "#1f1f1f"
-        accent_b = "#4a9eff" if self._is_dark else "#0078d4"
-        accent_w = "#ff9f4a" if self._is_dark else "#e07a2f"
-
-        self.root.configure(bg=bg)
-
-        # Draggable (no title bar)
-        self._drag_data = {"x": 0, "y": 0}
-        self.root.bind("<ButtonPress-1>", self._start_drag)
-        self.root.bind("<B1-Motion>", self._do_drag)
-
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-
-        # Very thin modern sliders (2x thinner)
-        style.configure("ThinB.Horizontal.TScale", background=bg, troughcolor="#3a3a3a" if self._is_dark else "#d0d0d0",
-                        sliderlength=8, sliderthickness=2)
-        style.configure("ThinW.Horizontal.TScale", background=bg, troughcolor="#3a3a3a" if self._is_dark else "#d0d0d0",
-                        sliderlength=8, sliderthickness=2)
-
-        b0, w0 = self.get_state()
-        self.b_var = tk.IntVar(value=b0)
-        self.w_var = tk.IntVar(value=w0)
-
-        # Only B and W labels (big, clear)
-        self.b_label = tk.Label(self.root, text="B", bg=bg, fg=accent_b, font=("Segoe UI", 11, "bold"))
-        self.w_label = tk.Label(self.root, text="W", bg=bg, fg=accent_w, font=("Segoe UI", 11, "bold"))
-
-        self.b_value = tk.Label(self.root, text=f"{b0}%", bg=bg, fg=fg, font=("Segoe UI", 11))
-        self.w_value = tk.Label(self.root, text=f"{w0}%", bg=bg, fg=fg, font=("Segoe UI", 11))
-
-        self.b_scale = ttk.Scale(self.root, from_=10, to=100, orient=tk.HORIZONTAL,
-                                 variable=self.b_var, command=self._on_slider,
-                                 style="ThinB.Horizontal.TScale")
-        self.w_scale = ttk.Scale(self.root, from_=0, to=100, orient=tk.HORIZONTAL,
-                                 variable=self.w_var, command=self._on_slider,
-                                 style="ThinW.Horizontal.TScale")
-
-        # Tight glass-like layout
-        self.b_label.grid(row=0, column=0, padx=(10, 3), pady=(8, 1), sticky="w")
-        self.b_scale.grid(row=0, column=1, padx=2, pady=(8, 1), sticky="ew")
-        self.b_value.grid(row=0, column=2, padx=(3, 10), pady=(8, 1))
-
-        self.w_label.grid(row=1, column=0, padx=(10, 3), pady=(1, 6), sticky="w")
-        self.w_scale.grid(row=1, column=1, padx=2, pady=(1, 6), sticky="ew")
-        self.w_value.grid(row=1, column=2, padx=(3, 10), pady=(1, 6))
-
-        # Subtle preview bar (2x thinner)
-        preview_bg = "#2a2a2a" if self._is_dark else "#e8e8e8"
-        self.preview = tk.Canvas(self.root, width=130, height=7, bg=preview_bg,
-                                 highlightthickness=0, bd=0)
-        self.preview.grid(row=2, column=0, columnspan=3, padx=10, pady=(0, 8), sticky="ew")
-
-        self.root.grid_columnconfigure(1, weight=1)
-
-        self.root.protocol("WM_DELETE_WINDOW", self._hide)
-        self.root.bind("<<ShowSliders>>", lambda e: self._show())
-        self.root.bind("<Escape>", lambda e: self._hide())
-        self.root.withdraw()
-        self.root.mainloop()
-
-    def _start_drag(self, event):
-        self._drag_data = {"x": event.x, "y": event.y}
-
-    def _do_drag(self, event):
-        x = self.root.winfo_x() + event.x - self._drag_data["x"]
-        y = self.root.winfo_y() + event.y - self._drag_data["y"]
-        self.root.geometry(f"+{x}+{y}")
-
-    def _on_slider(self, _value=None):
-        if self._syncing:
-            return
-        b = self.b_var.get()
-        w = self.w_var.get()
-        self._update_preview_and_labels(b, w)
-        self.on_change(b, w)
-
-    def _update_preview_and_labels(self, b: int, w: int):
-        if not self.root:
-            return
-
-        self.b_value.config(text=f"{b}%")
-        self.w_value.config(text=f"{w}%")
-
-        c = self.preview
-        c.delete("all")
-        width = c.winfo_width() or 130
-        height = 7
-
-        for x in range(width):
-            warmth_influence = w / 100.0
-            if self._is_dark:
-                r = int(80 * (1 - warmth_influence * 0.3) + 255 * warmth_influence * 0.9)
-                g = int(90 * (1 - warmth_influence * 0.2) + 170 * warmth_influence)
-                b_col = int(110 * (1 - warmth_influence * 0.5) + 70 * warmth_influence)
-            else:
-                r = int(200 + 55 * warmth_influence * 0.8)
-                g = int(210 - 40 * warmth_influence * 0.5)
-                b_col = int(220 - 150 * warmth_influence * 0.7)
-            color = f"#{max(0, min(255, r)):02x}{max(0, min(255, g)):02x}{max(0, min(255, b_col)):02x}"
-            c.create_line(x, 0, x, height, fill=color)
-
-    def _show(self):
-        self._syncing = True
-        b, w = self.get_state()
-        self.b_var.set(b)
-        self.w_var.set(w)
-        self._syncing = False
-        self._position_window()   # set geometry while withdrawn -> no flicker/reset
-        self.root.deiconify()
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-        # borderless (overrideredirect) windows don't grab focus on their own;
-        # force it so <FocusOut> fires when the user clicks away
-        self.root.focus_force()
-
-        self.root.bind("<FocusOut>", self._on_focus_out, add="+")
-        self.root.after(50, lambda: self._update_preview_and_labels(b, w))
-
-    def _position_window(self):
-        """Place at last saved spot, else above the tray icon (bottom-right)."""
-        self.root.update_idletasks()
-        # reqwidth/reqheight = layout size; winfo_width is 1 until first mapped
-        w = self.root.winfo_reqwidth()
-        h = self.root.winfo_reqheight()
-        area = _work_area()
-
-        pos = _load_window_pos()
-        if pos is not None:
-            x, y = pos
-        elif area is not None:
-            left, top, right, bottom = area
-            x = right - w - 12          # hug right edge, above the tray
-            y = bottom - h - 12         # sit just above the taskbar
-        else:
-            x, y = 100, 100
-
-        if area is not None:            # clamp so it stays on-screen
-            left, top, right, bottom = area
-            x = max(left, min(x, right - w))
-            y = max(top, min(y, bottom - h))
-
-        self.root.geometry(f"+{x}+{y}")
-
-    def _on_focus_out(self, event):
-        # FocusOut also fires when focus moves between the window's own
-        # children (e.g. clicking a slider). Only hide when focus actually
-        # left the app: focus_get() is None when no widget here has focus.
-        if self.root:
-            self.root.after(60, self._hide_if_unfocused)
-
-    def _hide_if_unfocused(self):
-        if self.root and self.root.focus_get() is None:
-            self._hide()
-
-    def _hide(self):
-        if self.root:
-            try:
-                self._save_pos()
-            except Exception:
-                pass
-            try:
-                self.root.grab_release()
-            except Exception:
-                pass
-            self.root.withdraw()
-
-    def _save_pos(self):
-        if self.root and self.root.winfo_exists():
-            _save_window_pos(self.root.winfo_x(), self.root.winfo_y())
-
-    def request_show(self):
-        if self.root is None:
-            return
-        try:
-            self.root.event_generate("<<ShowSliders>>", when="tail")
-        except Exception as e:
-            print(f"Could not open sliders: {e}")
-
-
 # ─── TRAY ICON ────────────────────────────────────────────────────────────────
 
 class BrightnessApp:
     def __init__(self):
+        self._state_lock = threading.RLock()
         self.brightness, self.warmth = _load_settings()
-        set_brightness(self.brightness, self.warmth)
+        self._last_apply_ok = set_brightness(self.brightness, self.warmth)
         _save_settings(self.brightness, self.warmth)  # ensure settings.json exists after first launch
         self.icon = self._create_icon()
         self._resume_reapply_lock = threading.Lock()
-        self.slider = SliderWindow(
-            on_change=lambda b, w: self._apply(brightness=b, warmth=w),
-            get_state=lambda: (self.brightness, self.warmth),
-        )
 
     def _reapply_after_resume(self):
         # Resume can happen before the display driver is fully ready.
@@ -721,11 +429,21 @@ class BrightnessApp:
         try:
             time.sleep(1.0)
             for _ in range(6):
-                if set_brightness(self.brightness, self.warmth):
-                    self.icon.title = f"NVIDIA Brightness: {self.brightness}% ✓"
-                    return
+                with self._state_lock:
+                    brightness = self.brightness
+                    warmth = self.warmth
+                    self._last_apply_ok = set_brightness(brightness, warmth)
+                    if self._last_apply_ok:
+                        self.icon.title = (
+                            f"NVIDIA Brightness: {brightness}% · warm {warmth}% ✓"
+                        )
+                        return
                 time.sleep(0.5)
-            self.icon.title = f"NVIDIA Brightness: {self.brightness}% ✗ GDI failed"
+            with self._state_lock:
+                self.icon.title = (
+                    f"NVIDIA Brightness: {self.brightness}% · "
+                    f"warm {self.warmth}% ✗ GDI failed"
+                )
         finally:
             self._resume_reapply_lock.release()
 
@@ -763,8 +481,6 @@ class BrightnessApp:
         ]
 
         menu = pystray.Menu(
-            item("Open sliders…", lambda i, it: self.slider.request_show()),
-            pystray.Menu.SEPARATOR,
             item("☀ Brightness", pystray.Menu(*brightness_items)),
             item("🌅 Warmth", pystray.Menu(*warmth_items)),
             pystray.Menu.SEPARATOR,
@@ -789,13 +505,17 @@ class BrightnessApp:
         )
 
     def _apply(self, brightness=None, warmth=None):
-        if brightness is not None:
-            self.brightness = max(10, min(100, int(brightness)))
-        if warmth is not None:
-            self.warmth = max(0, min(100, int(warmth)))
-        ok = set_brightness(self.brightness, self.warmth)
+        with self._state_lock:
+            if brightness is not None:
+                self.brightness = max(10, min(100, int(brightness)))
+            if warmth is not None:
+                self.warmth = max(0, min(100, int(warmth)))
+            self._last_apply_ok = set_brightness(self.brightness, self.warmth)
+            self._commit_state_locked()
+
+    def _commit_state_locked(self):
         _save_settings(self.brightness, self.warmth)
-        status = "✓" if ok else "✗ GDI failed"
+        status = "✓" if self._last_apply_ok else "✗ GDI failed"
         self.icon.icon = self._make_icon_image(self.brightness, self.warmth)
         self.icon.title = f"NVIDIA Brightness: {self.brightness}% · warm {self.warmth}% {status}"
         try:
@@ -805,7 +525,8 @@ class BrightnessApp:
         print(f"Brightness → {self.brightness}%  Warmth → {self.warmth}% ({status})")
 
     def _step(self, delta: int):
-        self._apply(brightness=self.brightness + delta)
+        with self._state_lock:
+            self._apply(brightness=self.brightness + delta)
 
     def _toggle_autostart(self, icon, item):
         if is_autostart_enabled():
@@ -829,6 +550,41 @@ class BrightnessApp:
 
 
 # ─── ENTRY ───────────────────────────────────────────────────────────────────
+
+def _acquire_single_instance() -> bool:
+    """Hold a named mutex for the lifetime of this process."""
+    global _instance_mutex
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [
+        wintypes.LPVOID,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    ]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateMutexW(
+        None,
+        False,
+        r"Local\NvidiaBrightnessTray",
+    )
+    if not handle:
+        return False
+    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return False
+    _instance_mutex = handle
+    return True
+
+
+def _release_single_instance() -> None:
+    global _instance_mutex
+    if _instance_mutex:
+        ctypes.windll.kernel32.CloseHandle(_instance_mutex)
+        _instance_mutex = None
+
 
 def _startup_lnk_path() -> str:
     startup_dir = os.path.join(
@@ -879,17 +635,23 @@ def disable_autostart() -> None:
 
 
 if __name__ == "__main__":
+    if not _acquire_single_instance():
+        raise SystemExit(0)
+
     # Require admin for gamma ramp on some systems
     if ctypes.windll.shell32.IsUserAnAdmin() == 0:
         print("Note: Run as Administrator if brightness changes don't apply.")
 
-    first_run = not os.path.exists(SETTINGS_PATH)
+    try:
+        first_run = not os.path.exists(SETTINGS_PATH)
 
-    _enable_system_theme_menus()  # native tray menu follows system dark/light
+        _enable_system_theme_menus()  # native tray menu follows system dark/light
 
-    app = BrightnessApp()  # writes settings.json, so after this first_run is consumed
+        app = BrightnessApp()  # writes settings.json, so after this first_run is consumed
 
-    if first_run:
-        enable_autostart()
+        if first_run:
+            enable_autostart()
 
-    app.run()
+        app.run()
+    finally:
+        _release_single_instance()
